@@ -8,25 +8,50 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-)
 
-var (
-	addr = flag.String("addr", ":50051", "gRPC listen address")
+	"google.golang.org/grpc"
+
+	searchv1 "github.com/notandruu/distributed-search-engine/gen/search/v1"
+	"github.com/notandruu/distributed-search-engine/internal/config"
+	"github.com/notandruu/distributed-search-engine/internal/gateway"
 )
 
 func main() {
 	flag.Parse()
 
-	lis, err := net.Listen("tcp", *addr)
+	cfg := config.LoadGateway()
+
+	lis, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
-		log.Fatalf("listen: %v", err)
+		log.Fatalf("listen %s: %v", cfg.Addr, err)
 	}
 
-	fmt.Printf("gateway listening on %s\n", *addr)
+	srv, err := gateway.NewServer(gateway.Options{
+		ShardAddrs:      cfg.ShardAddrs,
+		MaxConcurrent:   cfg.MaxConcurrentSearches,
+		SearchTimeoutMS: cfg.SearchTimeoutMS,
+		ShardTimeoutMS:  cfg.ShardTimeoutMS,
+	})
+	if err != nil {
+		log.Fatalf("create gateway: %v", err)
+	}
+	defer srv.Close()
+
+	grpcSrv := grpc.NewServer()
+	searchv1.RegisterSearchGatewayServer(grpcSrv, srv)
+
+	go func() {
+		fmt.Printf("{\"service\":\"gateway\",\"event\":\"start\",\"addr\":%q,\"shards\":%d}\n",
+			cfg.Addr, len(cfg.ShardAddrs))
+		if err := grpcSrv.Serve(lis); err != nil {
+			log.Fatalf("serve: %v", err)
+		}
+	}()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	lis.Close()
+	grpcSrv.GracefulStop()
+	fmt.Println(`{"service":"gateway","event":"shutdown"}`)
 }

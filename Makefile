@@ -9,10 +9,16 @@ BUF     := buf
 .PHONY: proto
 proto:
 	@echo "==> Generating protobuf code"
+	@mkdir -p gen/search/v1
 	$(PROTOC) \
-		--go_out=. --go_opt=paths=source_relative \
-		--go-grpc_out=. --go-grpc_opt=paths=source_relative \
+		--go_out=gen/search/v1 --go_opt=paths=import \
+		--go_opt=Mproto/search/v1/search.proto=github.com/notandruu/distributed-search-engine/gen/search/v1 \
+		--go-grpc_out=gen/search/v1 --go-grpc_opt=paths=import \
+		--go-grpc_opt=Mproto/search/v1/search.proto=github.com/notandruu/distributed-search-engine/gen/search/v1 \
 		proto/search/v1/search.proto
+	@mv gen/search/v1/github.com/notandruu/distributed-search-engine/gen/search/v1/* gen/search/v1/ 2>/dev/null || true
+	@rm -rf gen/search/v1/github.com 2>/dev/null || true
+	@echo "==> Done"
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 .PHONY: build
