@@ -62,10 +62,7 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: |
-          pip install pytest numpy pandas tqdm grpcio grpcio-tools protobuf
+        run: pip install -r requirements.txt
 
       - name: Run Python tests
-        run: |
-          if [ -d "tests" ]; then pytest tests/ -v; fi
-          if [ -f "scripts/test_eval.py" ]; then pytest scripts/test_eval.py -v; fi
+        run: pytest tests/ -v
