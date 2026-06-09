@@ -4,17 +4,22 @@ import (
 	"container/heap"
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
+	grpccodes "google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
+	gstatus "google.golang.org/grpc/status"
 
 	searchv1 "github.com/notandruu/distributed-search-engine/gen/search/v1"
 	"github.com/notandruu/distributed-search-engine/internal/cache"
+	"github.com/notandruu/distributed-search-engine/internal/observability"
 )
 
 // shardClient wraps a gRPC client for one shard.
@@ -31,18 +36,21 @@ type Server struct {
 
 	shards          []*shardClient
 	cache           *cache.Client
+	metrics         *observability.GatewayMetrics
+	tracer          trace.Tracer
 	maxConcurrent   int64
 	activeSem       atomic.Int64
 	searchTimeoutMS int
 	shardTimeoutMS  int
 
-	mu sync.RWMutex // guards shards after construction
+	mu sync.RWMutex
 }
 
 // Options configures a new Server.
 type Options struct {
 	ShardAddrs      []string
 	Cache           *cache.Client
+	Metrics         *observability.GatewayMetrics
 	MaxConcurrent   int
 	SearchTimeoutMS int
 	ShardTimeoutMS  int
@@ -61,6 +69,8 @@ func NewServer(opts Options) (*Server, error) {
 
 	srv := &Server{
 		cache:           opts.Cache,
+		metrics:         opts.Metrics,
+		tracer:          observability.Tracer(),
 		maxConcurrent:   int64(opts.MaxConcurrent),
 		searchTimeoutMS: opts.SearchTimeoutMS,
 		shardTimeoutMS:  opts.ShardTimeoutMS,
@@ -94,7 +104,7 @@ func (s *Server) Close() {
 
 func (s *Server) Search(ctx context.Context, req *searchv1.SearchRequest) (*searchv1.SearchResponse, error) {
 	if req.Query == "" {
-		return nil, status.Error(codes.InvalidArgument, "query must not be empty")
+		return nil, gstatus.Error(grpccodes.InvalidArgument, "query must not be empty")
 	}
 	if req.TopK <= 0 {
 		req.TopK = 10
@@ -104,26 +114,67 @@ func (s *Server) Search(ctx context.Context, req *searchv1.SearchRequest) (*sear
 	cur := s.activeSem.Add(1)
 	defer s.activeSem.Add(-1)
 	if cur > s.maxConcurrent {
-		return nil, status.Error(codes.ResourceExhausted, "gateway at capacity")
+		if s.metrics != nil {
+			s.metrics.BackpressureRejected.Inc()
+		}
+		return nil, gstatus.Error(grpccodes.ResourceExhausted, "gateway at capacity")
 	}
 
 	start := time.Now()
+	ctx, span := s.tracer.Start(ctx, "gateway.Search",
+		trace.WithAttributes(
+			attribute.String("query", req.Query),
+			attribute.Int("top_k", int(req.TopK)),
+		),
+	)
+	defer span.End()
 
 	// Apply global search timeout.
 	searchCtx, cancel := context.WithTimeout(ctx, time.Duration(s.searchTimeoutMS)*time.Millisecond)
 	defer cancel()
 
 	// Cache-aside: check Redis first.
+	cacheHit := false
 	if s.cache != nil {
-		if cached, err := s.cache.Get(searchCtx, req.Query, req.TopK); err == nil && cached != nil {
+		cacheCtx, ccancel := context.WithTimeout(searchCtx, 10*time.Millisecond)
+		_, cspan := s.tracer.Start(cacheCtx, "gateway.RedisGet")
+		cached, err := s.cache.Get(cacheCtx, req.Query, req.TopK)
+		ccancel()
+		if err == nil && cached != nil {
+			cspan.SetAttributes(attribute.Bool("cache.hit", true))
+			cspan.End()
+			if s.metrics != nil {
+				s.metrics.CacheHits.Inc()
+				s.metrics.SearchRequests.WithLabelValues("ok").Inc()
+				s.metrics.SearchDuration.WithLabelValues("true").Observe(time.Since(start).Seconds())
+			}
 			cached.Stats.TookMs = time.Since(start).Milliseconds()
 			cached.Stats.CacheHit = true
+			span.SetAttributes(attribute.Bool("cache.hit", true))
 			return cached, nil
+		}
+		cspan.SetAttributes(attribute.Bool("cache.hit", false))
+		cspan.End()
+		if s.metrics != nil {
+			s.metrics.CacheMisses.Inc()
 		}
 	}
 
 	// Fan out to all shards.
-	results, failedShards := s.fanout(searchCtx, req)
+	fanoutCtx, fanoutSpan := s.tracer.Start(searchCtx, "gateway.Fanout",
+		trace.WithAttributes(attribute.Int("shards.total", len(s.shards))),
+	)
+	results, failedShards := s.fanout(fanoutCtx, req)
+	fanoutSpan.SetAttributes(
+		attribute.Int("shards.succeeded", len(s.shards)-len(failedShards)),
+	)
+	fanoutSpan.End()
+
+	// Merge top-K.
+	_, mergeSpan := s.tracer.Start(ctx, "gateway.MergeTopK",
+		trace.WithAttributes(attribute.Int("results.count", len(results))),
+	)
+	mergeSpan.End()
 
 	took := time.Since(start).Milliseconds()
 	resp := &searchv1.SearchResponse{
@@ -132,17 +183,45 @@ func (s *Server) Search(ctx context.Context, req *searchv1.SearchRequest) (*sear
 		FailedShards:   failedShards,
 		Stats: &searchv1.SearchStats{
 			TookMs:          took,
-			CacheHit:        false,
+			CacheHit:        cacheHit,
 			ShardsQueried:   int32(len(s.shards)),
 			ShardsSucceeded: int32(len(s.shards) - len(failedShards)),
 		},
 	}
 
-	// Populate cache on success (non-partial, background).
+	span.SetAttributes(
+		attribute.Bool("cache.hit", false),
+		attribute.Int("results.count", len(results)),
+		attribute.Bool("partial_failure", resp.PartialFailure),
+	)
+
+	if resp.PartialFailure {
+		span.SetStatus(otelcodes.Error, "partial shard failure")
+		if s.metrics != nil {
+			s.metrics.PartialFailures.Inc()
+		}
+	}
+
+	// Populate cache in background.
 	if s.cache != nil && !resp.PartialFailure {
-		cacheCtx, ccancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-		defer ccancel()
-		_ = s.cache.Set(cacheCtx, req.Query, req.TopK, resp)
+		go func() {
+			bgCtx, bgCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			defer bgCancel()
+			_, setSpan := s.tracer.Start(bgCtx, "gateway.RedisSet")
+			if err := s.cache.Set(bgCtx, req.Query, req.TopK, resp); err != nil && s.metrics != nil {
+				s.metrics.CacheSetErrors.Inc()
+			}
+			setSpan.End()
+		}()
+	}
+
+	if s.metrics != nil {
+		status := "ok"
+		if resp.PartialFailure {
+			status = "partial"
+		}
+		s.metrics.SearchRequests.WithLabelValues(status).Inc()
+		s.metrics.SearchDuration.WithLabelValues(strconv.FormatBool(cacheHit)).Observe(time.Since(start).Seconds())
 	}
 
 	return resp, nil
@@ -180,7 +259,6 @@ func (s *Server) fanout(ctx context.Context, req *searchv1.SearchRequest) ([]*se
 		}(sc)
 	}
 
-	// Collect all shard results.
 	allResults := make([]*searchv1.SearchResult, 0, int(req.TopK)*len(s.shards))
 	var failedShards []string
 
@@ -193,13 +271,10 @@ func (s *Server) fanout(ctx context.Context, req *searchv1.SearchRequest) ([]*se
 		allResults = append(allResults, r.results...)
 	}
 
-	// Merge into global top-K using a min-heap.
-	merged := topKMergeProto(allResults, int(req.TopK))
-	return merged, failedShards
+	return topKMergeProto(allResults, int(req.TopK)), failedShards
 }
 
 // resultMinHeap is a min-heap of SearchResult pointers ordered by score ascending.
-// The root always holds the lowest score — we pop it when a higher score arrives.
 type resultMinHeap []*searchv1.SearchResult
 
 func (h resultMinHeap) Len() int            { return len(h) }
@@ -219,10 +294,8 @@ func topKMergeProto(results []*searchv1.SearchResult, k int) []*searchv1.SearchR
 	if k <= 0 || len(results) == 0 {
 		return nil
 	}
-
 	h := &resultMinHeap{}
 	heap.Init(h)
-
 	for _, r := range results {
 		if h.Len() < k {
 			heap.Push(h, r)
@@ -231,8 +304,6 @@ func topKMergeProto(results []*searchv1.SearchResult, k int) []*searchv1.SearchR
 			heap.Push(h, r)
 		}
 	}
-
-	// Drain heap into result slice (heap is min-heap, so drain gives ascending order).
 	out := make([]*searchv1.SearchResult, h.Len())
 	for i := len(out) - 1; i >= 0; i-- {
 		out[i] = heap.Pop(h).(*searchv1.SearchResult)
@@ -240,7 +311,7 @@ func topKMergeProto(results []*searchv1.SearchResult, k int) []*searchv1.SearchR
 	return out
 }
 
-// topKMerge is used by tests without proto types.
+// topKMerge is the test-accessible alias.
 func topKMerge(results []*searchv1.SearchResult, k int) []*searchv1.SearchResult {
 	return topKMergeProto(results, k)
 }
@@ -252,7 +323,6 @@ func (s *Server) Health(ctx context.Context, req *searchv1.HealthRequest) (*sear
 func (s *Server) Stats(ctx context.Context, req *searchv1.StatsRequest) (*searchv1.StatsResponse, error) {
 	var totalDocs, totalTerms, totalPostings int64
 	var totalDocLen float64
-
 	for _, sc := range s.shards {
 		statsCtx, cancel := context.WithTimeout(ctx, time.Duration(s.shardTimeoutMS)*time.Millisecond)
 		resp, err := sc.stub.Stats(statsCtx, &searchv1.StatsRequest{})
@@ -265,12 +335,10 @@ func (s *Server) Stats(ctx context.Context, req *searchv1.StatsRequest) (*search
 		totalPostings += resp.Postings
 		totalDocLen += resp.AvgDocLength * float64(resp.IndexedDocs)
 	}
-
 	var avgDocLen float64
 	if totalDocs > 0 {
 		avgDocLen = totalDocLen / float64(totalDocs)
 	}
-
 	return &searchv1.StatsResponse{
 		IndexedDocs:  totalDocs,
 		UniqueTerms:  totalTerms,

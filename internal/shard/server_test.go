@@ -10,7 +10,7 @@ import (
 )
 
 func TestHealth(t *testing.T) {
-	srv := NewServer(0)
+	srv := NewServer(0, nil)
 	resp, err := srv.Health(context.Background(), &searchv1.HealthRequest{})
 	if err != nil {
 		t.Fatalf("Health: %v", err)
@@ -21,7 +21,7 @@ func TestHealth(t *testing.T) {
 }
 
 func TestStats_empty(t *testing.T) {
-	srv := NewServer(0)
+	srv := NewServer(0, nil)
 	resp, err := srv.Stats(context.Background(), &searchv1.StatsRequest{})
 	if err != nil {
 		t.Fatalf("Stats: %v", err)
@@ -32,7 +32,7 @@ func TestStats_empty(t *testing.T) {
 }
 
 func TestIngest_basic(t *testing.T) {
-	srv := NewServer(0)
+	srv := NewServer(0, nil)
 	resp, err := srv.Ingest(context.Background(), &searchv1.IngestRequest{
 		Documents: []*searchv1.Document{
 			{Id: "doc-1", Title: "Distributed Systems", Body: "consensus replication raft paxos"},
@@ -56,7 +56,7 @@ func TestIngest_basic(t *testing.T) {
 }
 
 func TestIngest_rejectsEmptyID(t *testing.T) {
-	srv := NewServer(0)
+	srv := NewServer(0, nil)
 	resp, err := srv.Ingest(context.Background(), &searchv1.IngestRequest{
 		Documents: []*searchv1.Document{
 			{Id: "", Title: "bad doc", Body: "no id"},
@@ -71,7 +71,7 @@ func TestIngest_rejectsEmptyID(t *testing.T) {
 }
 
 func TestSearchShard_emptyQuery(t *testing.T) {
-	srv := NewServer(0)
+	srv := NewServer(0, nil)
 	_, err := srv.SearchShard(context.Background(), &searchv1.ShardSearchRequest{Query: ""})
 	if err == nil {
 		t.Fatal("expected error for empty query")
@@ -79,7 +79,7 @@ func TestSearchShard_emptyQuery(t *testing.T) {
 }
 
 func TestSearchShard_noResults(t *testing.T) {
-	srv := NewServer(0)
+	srv := NewServer(0, nil)
 	resp, err := srv.SearchShard(context.Background(), &searchv1.ShardSearchRequest{
 		Query: "nonexistenttoken12345",
 		TopK:  10,
@@ -93,7 +93,7 @@ func TestSearchShard_noResults(t *testing.T) {
 }
 
 func TestSearchShard_returnsResults(t *testing.T) {
-	srv := NewServer(0)
+	srv := NewServer(0, nil)
 	_, _ = srv.Ingest(context.Background(), &searchv1.IngestRequest{
 		Documents: []*searchv1.Document{
 			{Id: "doc-1", Title: "Raft Consensus", Body: "distributed consensus replication leader election"},
@@ -128,7 +128,7 @@ func TestSearchShard_returnsResults(t *testing.T) {
 }
 
 func TestSearchShard_topKRespected(t *testing.T) {
-	srv := NewServer(0)
+	srv := NewServer(0, nil)
 	docs := make([]*searchv1.Document, 20)
 	for i := range docs {
 		docs[i] = &searchv1.Document{
@@ -149,7 +149,7 @@ func TestSearchShard_topKRespected(t *testing.T) {
 }
 
 func TestConcurrentIngestAndSearch(t *testing.T) {
-	srv := NewServer(0)
+	srv := NewServer(0, nil)
 
 	const goroutines = 20
 	var wg sync.WaitGroup

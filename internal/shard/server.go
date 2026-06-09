@@ -7,11 +7,14 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	searchv1 "github.com/notandruu/distributed-search-engine/gen/search/v1"
 	"github.com/notandruu/distributed-search-engine/internal/index"
+	"github.com/notandruu/distributed-search-engine/internal/observability"
 	"github.com/notandruu/distributed-search-engine/internal/ranking"
 	"github.com/notandruu/distributed-search-engine/internal/tokenizer"
 )
@@ -25,13 +28,17 @@ type Server struct {
 	mu      sync.RWMutex
 	idx     *index.InvertedIndex
 	scorer  ranking.BM25
+	metrics *observability.ShardMetrics
+	tracer  trace.Tracer
 	shardID int32
 }
 
-func NewServer(shardID int32) *Server {
+func NewServer(shardID int32, metrics *observability.ShardMetrics) *Server {
 	return &Server{
 		idx:     index.New(),
 		scorer:  ranking.Default(),
+		metrics: metrics,
+		tracer:  observability.Tracer(),
 		shardID: shardID,
 	}
 }
@@ -41,20 +48,43 @@ func (s *Server) Ingest(ctx context.Context, req *searchv1.IngestRequest) (*sear
 		return &searchv1.IngestResponse{}, nil
 	}
 
+	ctx, span := s.tracer.Start(ctx, "shard.Ingest",
+		trace.WithAttributes(
+			attribute.Int("shard.id", int(s.shardID)),
+			attribute.Int("docs.count", len(req.Documents)),
+		),
+	)
+	defer span.End()
+
 	var accepted, rejected int64
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	for _, doc := range req.Documents {
 		if doc.Id == "" {
 			rejected++
 			continue
 		}
+		_, tokenSpan := s.tracer.Start(ctx, "shard.Tokenize")
 		tokens := tokenizeDoc(doc.Title, doc.Body)
+		tokenSpan.End()
+
 		preview := bodyPreview(doc.Body)
 		s.idx.Add(doc.Id, doc.Title, doc.Url, preview, tokens)
 		accepted++
+	}
+	uniqueTerms := int64(s.idx.UniqueTerms())
+	totalPostings := s.idx.TotalPostings()
+	s.mu.Unlock()
+
+	span.SetAttributes(attribute.Int64("docs.accepted", accepted))
+
+	if s.metrics != nil {
+		s.metrics.IngestBatches.Inc()
+		s.metrics.IngestDocuments.Add(float64(accepted))
+		s.metrics.IngestErrors.Add(float64(rejected))
+		s.metrics.DocsIndexed.Add(float64(accepted))
+		s.metrics.UniqueTermsGauge.Set(float64(uniqueTerms))
+		s.metrics.PostingsGauge.Set(float64(totalPostings))
 	}
 
 	return &searchv1.IngestResponse{
@@ -72,13 +102,27 @@ func (s *Server) SearchShard(ctx context.Context, req *searchv1.ShardSearchReque
 	}
 
 	start := time.Now()
+	ctx, span := s.tracer.Start(ctx, "shard.SearchShard",
+		trace.WithAttributes(
+			attribute.Int("shard.id", int(s.shardID)),
+			attribute.String("query", req.Query),
+			attribute.Int("top_k", int(req.TopK)),
+		),
+	)
+	defer span.End()
 
+	_, tokenSpan := s.tracer.Start(ctx, "shard.Tokenize")
 	queryTerms := tokenizer.Tokenize(req.Query)
+	tokenSpan.End()
+
 	if len(queryTerms) == 0 {
 		return &searchv1.ShardSearchResponse{TookMs: time.Since(start).Milliseconds()}, nil
 	}
 
 	s.mu.RLock()
+	_, scoreSpan := s.tracer.Start(ctx, "shard.BM25Score",
+		trace.WithAttributes(attribute.Int("terms.count", len(queryTerms))),
+	)
 	scored := s.scorer.ScoreQuery(s.idx, queryTerms, int(req.TopK))
 	results := make([]*searchv1.SearchResult, 0, len(scored))
 	for _, sd := range scored {
@@ -94,11 +138,20 @@ func (s *Server) SearchShard(ctx context.Context, req *searchv1.ShardSearchReque
 			ShardId: s.shardID,
 		})
 	}
+	scoreSpan.SetAttributes(attribute.Int("results.count", len(results)))
+	scoreSpan.End()
 	s.mu.RUnlock()
+
+	took := time.Since(start)
+	span.SetAttributes(attribute.Int("results.count", len(results)))
+
+	if s.metrics != nil {
+		s.metrics.SearchDuration.WithLabelValues().Observe(took.Seconds())
+	}
 
 	return &searchv1.ShardSearchResponse{
 		Results: results,
-		TookMs:  time.Since(start).Milliseconds(),
+		TookMs:  took.Milliseconds(),
 	}, nil
 }
 
@@ -109,7 +162,6 @@ func (s *Server) Health(ctx context.Context, req *searchv1.HealthRequest) (*sear
 func (s *Server) Stats(ctx context.Context, req *searchv1.StatsRequest) (*searchv1.StatsResponse, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
 	return &searchv1.StatsResponse{
 		IndexedDocs:  int64(s.idx.TotalDocs),
 		UniqueTerms:  int64(s.idx.UniqueTerms()),
@@ -122,13 +174,10 @@ func (s *Server) String() string {
 	return fmt.Sprintf("ShardServer(id=%d)", s.shardID)
 }
 
-// tokenizeDoc combines title and body into one token stream.
 func tokenizeDoc(title, body string) []string {
-	combined := title + " " + body
-	return tokenizer.Tokenize(combined)
+	return tokenizer.Tokenize(title + " " + body)
 }
 
-// bodyPreview returns a UTF-8 safe prefix of the body for display.
 func bodyPreview(body string) string {
 	if len(body) <= bodyPreviewMaxBytes {
 		return body
