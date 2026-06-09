@@ -9,3 +9,5 @@ FROM gcr.io/distroless/static-debian12
 COPY --from=builder /bin/shard /shard
 EXPOSE 50052 2113
 ENTRYPOINT ["/shard"]
+# Default args; override with docker-compose command: field
+CMD ["--addr=:50052", "--shard-id=0"]

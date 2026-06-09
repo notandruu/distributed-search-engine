@@ -10,6 +10,9 @@ processors:
   batch:
     timeout: 1s
     send_batch_size: 1024
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 256
 
 exporters:
   otlp/jaeger:
@@ -18,16 +21,17 @@ exporters:
       insecure: true
   prometheus:
     endpoint: "0.0.0.0:8889"
-  logging:
-    verbosity: normal
+    namespace: dse
+  debug:
+    verbosity: basic
 
 service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [batch]
-      exporters: [otlp/jaeger, logging]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/jaeger, debug]
     metrics:
       receivers: [otlp]
-      processors: [batch]
+      processors: [memory_limiter, batch]
       exporters: [prometheus]

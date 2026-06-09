@@ -90,20 +90,20 @@ generate-corpus-100k:
 		--out data/corpus_100k.jsonl
 
 .PHONY: index-100k
-index-100k: generate-corpus-100k
+index-100k: generate-corpus-100k build
 	@echo "==> Indexing 100K documents"
 	$(BINARY_DIR)/ingest \
 		--input data/corpus_100k.jsonl \
-		--gateway localhost:50051 \
+		--shard-addrs localhost:50062,localhost:50063,localhost:50064,localhost:50065 \
 		--workers 8 \
 		--batch-size 256
 
 .PHONY: index-1m
-index-1m: generate-corpus
+index-1m: generate-corpus build
 	@echo "==> Indexing 1M documents"
 	$(BINARY_DIR)/ingest \
 		--input data/corpus_1m.jsonl \
-		--gateway localhost:50051 \
+		--shard-addrs localhost:50062,localhost:50063,localhost:50064,localhost:50065 \
 		--workers 16 \
 		--batch-size 256
 
@@ -132,6 +132,18 @@ bench-summary:
 		--out bench/BENCHMARK_SUMMARY.md
 
 # ── Kubernetes ────────────────────────────────────────────────────────────────
+.PHONY: k8s-cluster
+k8s-cluster:
+	@echo "==> Creating kind cluster"
+	kind create cluster --config deploy/k8s/kind-config.yaml --name dse
+
+.PHONY: k8s-load-images
+k8s-load-images: docker-build
+	@echo "==> Loading images into kind cluster"
+	kind load docker-image dse-gateway:latest --name dse
+	kind load docker-image dse-shard:latest   --name dse
+	kind load docker-image dse-ingest:latest  --name dse
+
 .PHONY: k8s-up
 k8s-up:
 	@echo "==> Deploying to local Kubernetes cluster"

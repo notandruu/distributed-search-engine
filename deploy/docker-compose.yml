@@ -1,7 +1,7 @@
 version: "3.9"
 
-x-shard-common: &shard-common
-  image: dse-shard:latest
+# ── Shared shard template ─────────────────────────────────────────────────────
+x-shard: &shard-base
   build:
     context: ..
     dockerfile: deploy/Dockerfile.shard
@@ -10,21 +10,25 @@ x-shard-common: &shard-common
     - otel-collector
 
 services:
+
+  # ── Gateway ─────────────────────────────────────────────────────────────────
   gateway:
-    image: dse-gateway:latest
     build:
       context: ..
       dockerfile: deploy/Dockerfile.gateway
     ports:
-      - "50051:50051"
-      - "2112:2112"
+      - "50051:50051"   # gRPC
+      - "2112:2112"     # Prometheus /metrics
     environment:
-      - SHARD_ADDRS=shard-0:50052,shard-1:50052,shard-2:50052,shard-3:50052
-      - REDIS_ADDR=redis:6379
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
-      - MAX_CONCURRENT_SEARCHES=256
-      - SEARCH_TIMEOUT_MS=100
-      - SHARD_TIMEOUT_MS=75
+      SHARD_ADDRS: "shard-0:50052,shard-1:50052,shard-2:50052,shard-3:50052"
+      REDIS_ADDR: "redis:6379"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
+      MAX_CONCURRENT_SEARCHES: "256"
+      SEARCH_TIMEOUT_MS: "100"
+      SHARD_TIMEOUT_MS: "75"
+      CACHE_TTL_SECONDS: "300"
+      INDEX_VERSION: "1"
+      METRICS_ADDR: ":2112"
     depends_on:
       - redis
       - shard-0
@@ -32,59 +36,71 @@ services:
       - shard-2
       - shard-3
       - otel-collector
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50051 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
     restart: unless-stopped
 
+  # ── Shards ──────────────────────────────────────────────────────────────────
   shard-0:
-    <<: *shard-common
+    <<: *shard-base
     command: ["--addr=:50052", "--shard-id=0"]
     environment:
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
+      METRICS_ADDR: ":2113"
     ports:
       - "50062:50052"
       - "2120:2113"
 
   shard-1:
-    <<: *shard-common
+    <<: *shard-base
     command: ["--addr=:50052", "--shard-id=1"]
     environment:
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
+      METRICS_ADDR: ":2113"
     ports:
       - "50063:50052"
       - "2121:2113"
 
   shard-2:
-    <<: *shard-common
+    <<: *shard-base
     command: ["--addr=:50052", "--shard-id=2"]
     environment:
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
+      METRICS_ADDR: ":2113"
     ports:
       - "50064:50052"
       - "2122:2113"
 
   shard-3:
-    <<: *shard-common
+    <<: *shard-base
     command: ["--addr=:50052", "--shard-id=3"]
     environment:
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
+      METRICS_ADDR: ":2113"
     ports:
       - "50065:50052"
       - "2123:2113"
 
+  # ── Redis ────────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
     restart: unless-stopped
 
+  # ── Observability ─────────────────────────────────────────────────────────
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.97.0
-    command: ["--config=/etc/otel-collector-config.yaml"]
+    command: ["--config=/etc/otel/config.yaml"]
     volumes:
-      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+      - ./otel-collector-config.yaml:/etc/otel/config.yaml:ro
     ports:
-      - "4317:4317"
-      - "4318:4318"
-      - "8889:8889"
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8889:8889"   # Prometheus scrape endpoint
     restart: unless-stopped
 
   prometheus:
@@ -94,14 +110,17 @@ services:
     ports:
       - "9090:9090"
     restart: unless-stopped
+    depends_on:
+      - otel-collector
 
   grafana:
     image: grafana/grafana:10.4.0
     ports:
       - "3000:3000"
     environment:
-      - GF_AUTH_ANONYMOUS_ENABLED=true
-      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
     volumes:
       - grafana-data:/var/lib/grafana
     depends_on:
@@ -112,10 +131,10 @@ services:
   jaeger:
     image: jaegertracing/all-in-one:1.56
     ports:
-      - "16686:16686"
-      - "14250:14250"
+      - "16686:16686"  # Jaeger UI
+      - "14250:14250"  # Jaeger gRPC receiver
     environment:
-      - COLLECTOR_OTLP_ENABLED=true
+      COLLECTOR_OTLP_ENABLED: "true"
     restart: unless-stopped
 
 volumes:
