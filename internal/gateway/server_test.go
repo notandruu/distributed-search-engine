@@ -8,7 +8,7 @@ import (
 )
 
 func TestHealth(t *testing.T) {
-	srv, err := NewServer(Options{ShardAddrs: nil})
+	srv, err := NewServer(Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -22,7 +22,7 @@ func TestHealth(t *testing.T) {
 }
 
 func TestSearch_emptyQuery(t *testing.T) {
-	srv, err := NewServer(Options{ShardAddrs: nil})
+	srv, err := NewServer(Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +33,7 @@ func TestSearch_emptyQuery(t *testing.T) {
 }
 
 func TestSearch_noShards(t *testing.T) {
-	srv, err := NewServer(Options{ShardAddrs: nil})
+	srv, err := NewServer(Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +49,7 @@ func TestSearch_noShards(t *testing.T) {
 	}
 }
 
-func TestTopKMerge(t *testing.T) {
+func TestTopKMerge_ordering(t *testing.T) {
 	results := []*searchv1.SearchResult{
 		{DocId: "a", Score: 1.0},
 		{DocId: "b", Score: 3.0},
@@ -65,17 +65,48 @@ func TestTopKMerge(t *testing.T) {
 	}
 }
 
+func TestTopKMerge_fewerThanK(t *testing.T) {
+	results := []*searchv1.SearchResult{
+		{DocId: "a", Score: 5.0},
+		{DocId: "b", Score: 3.0},
+	}
+	top10 := topKMerge(results, 10)
+	if len(top10) != 2 {
+		t.Errorf("expected 2, got %d", len(top10))
+	}
+}
+
+func TestTopKMerge_empty(t *testing.T) {
+	result := topKMerge(nil, 10)
+	if len(result) != 0 {
+		t.Errorf("expected 0 for nil input, got %d", len(result))
+	}
+}
+
+func TestTopKMerge_sortedDescending(t *testing.T) {
+	results := []*searchv1.SearchResult{
+		{DocId: "a", Score: 1.0},
+		{DocId: "b", Score: 5.0},
+		{DocId: "c", Score: 3.0},
+		{DocId: "d", Score: 2.0},
+		{DocId: "e", Score: 4.0},
+	}
+	merged := topKMerge(results, 5)
+	for i := 1; i < len(merged); i++ {
+		if merged[i].Score > merged[i-1].Score {
+			t.Errorf("not sorted at index %d: %.2f > %.2f", i, merged[i].Score, merged[i-1].Score)
+		}
+	}
+}
+
 func TestBackpressure(t *testing.T) {
-	srv, err := NewServer(Options{
-		ShardAddrs:    nil,
-		MaxConcurrent: 1,
-	})
+	srv, err := NewServer(Options{MaxConcurrent: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Simulate 2 in-flight (counter = 2 > max 1).
-	srv.activeConcurrent.Add(2)
+	// Pre-fill the semaphore so the next request is rejected.
+	srv.activeSem.Add(2)
 	_, err = srv.Search(context.Background(), &searchv1.SearchRequest{Query: "test"})
 	if err == nil {
 		t.Fatal("expected ResourceExhausted error")
