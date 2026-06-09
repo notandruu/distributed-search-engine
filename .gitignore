@@ -1,0 +1,14 @@
+bin/
+data/
+bench/ghz_results.json
+bench/eval_results.json
+bench/eval_summary.md
+bench/BENCHMARK_SUMMARY.md
+*.test
+*.out
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+dist/

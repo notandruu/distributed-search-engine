@@ -1,0 +1,89 @@
+syntax = "proto3";
+
+package search.v1;
+
+option go_package = "github.com/notandruu/distributed-search-engine/gen/search/v1;searchv1";
+
+service SearchGateway {
+  rpc Search(SearchRequest) returns (SearchResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Stats(StatsRequest) returns (StatsResponse);
+}
+
+service ShardService {
+  rpc Ingest(IngestRequest) returns (IngestResponse);
+  rpc SearchShard(ShardSearchRequest) returns (ShardSearchResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Stats(StatsRequest) returns (StatsResponse);
+}
+
+message SearchRequest {
+  string query  = 1;
+  int32  top_k  = 2;
+  bool   explain = 3;
+}
+
+message SearchResponse {
+  repeated SearchResult results        = 1;
+  SearchStats           stats          = 2;
+  bool                  partial_failure = 3;
+  repeated string       failed_shards  = 4;
+}
+
+message SearchResult {
+  string doc_id   = 1;
+  string title    = 2;
+  string snippet  = 3;
+  double score    = 4;
+  int32  shard_id = 5;
+}
+
+message SearchStats {
+  int64 took_ms          = 1;
+  bool  cache_hit        = 2;
+  int32 shards_queried   = 3;
+  int32 shards_succeeded = 4;
+  int64 total_docs       = 5;
+}
+
+message IngestRequest {
+  repeated Document documents = 1;
+}
+
+message IngestResponse {
+  int64 accepted = 1;
+  int64 rejected = 2;
+}
+
+message Document {
+  string id    = 1;
+  string title = 2;
+  string body  = 3;
+  string url   = 4;
+}
+
+message ShardSearchRequest {
+  string query   = 1;
+  int32  top_k   = 2;
+  bool   explain = 3;
+}
+
+message ShardSearchResponse {
+  repeated SearchResult results  = 1;
+  int64                 took_ms  = 2;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  string status = 1;
+}
+
+message StatsRequest {}
+
+message StatsResponse {
+  int64  indexed_docs    = 1;
+  int64  unique_terms    = 2;
+  int64  postings        = 3;
+  double avg_doc_length  = 4;
+}

@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: shard
+  namespace: distributed-search
+spec:
+  serviceName: shard
+  replicas: 4
+  selector:
+    matchLabels:
+      app: shard
+  template:
+    metadata:
+      labels:
+        app: shard
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "2113"
+    spec:
+      containers:
+        - name: shard
+          image: dse-shard:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 50052
+              name: grpc
+            - containerPort: 2113
+              name: metrics
+          env:
+            - name: SHARD_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['apps.kubernetes.io/pod-index']
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector.distributed-search:4317"
+          readinessProbe:
+            grpc:
+              port: 50052
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+          volumeMounts:
+            - name: index-data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: index-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi

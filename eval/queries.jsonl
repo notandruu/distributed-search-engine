@@ -1,0 +1,5 @@
+{"query_id":"q1","query":"distributed consensus replication"}
+{"query_id":"q2","query":"fault tolerant storage systems"}
+{"query_id":"q3","query":"inverted index full text search"}
+{"query_id":"q4","query":"BM25 ranking information retrieval"}
+{"query_id":"q5","query":"concurrent programming goroutines channels"}
